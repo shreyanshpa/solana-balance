@@ -1,0 +1,19 @@
+{
+    "name": "solana-balance-checker",
+    "version": "1.0.0",
+    "type": "module",
+    "scripts": {
+        "start": "bun run src/index.ts",
+        "dev": "bun --watch src/index.ts"
+    },
+    "dependencies": {
+        "@solana/spl-token": "^0.4.9",
+        "@solana/web3.js": "^1.87.6",
+        "dotenv": "^16.4.7"
+    },
+    "devDependencies": {
+        "bun-types": "latest",
+        "typescript": "^5.0.0"
+    },
+    "module": "src/index.ts"
+}
