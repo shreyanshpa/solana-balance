@@ -1,19 +1,21 @@
 {
-    "name": "solana-balance-checker",
-    "version": "1.0.0",
-    "type": "module",
-    "scripts": {
-        "start": "bun run src/index.ts",
-        "dev": "bun --watch src/index.ts"
-    },
-    "dependencies": {
-        "@solana/spl-token": "^0.4.9",
-        "@solana/web3.js": "^1.87.6",
-        "dotenv": "^16.4.7"
-    },
-    "devDependencies": {
-        "bun-types": "latest",
-        "typescript": "^5.0.0"
-    },
-    "module": "src/index.ts"
+  "name": "pacifica-hackathon",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Pacifica Hackathon - Funding Rate Yield Curve & Delta-Neutral Vaults",
+  "scripts": {
+    "dev:yield-curve": "bun run src/yield-curve/index.ts",
+    "dev:vaults": "bun run src/vaults/index.ts",
+    "dev:api-test": "bun run src/common/api-test.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "typescript": "^5.0.0",
+    "@types/ws": "^8.5.10"
+  }
 }
