@@ -321,6 +321,13 @@ export class YieldCurveEngine {
     return this.curves;
   }
 
+  /**
+   * Load pre-computed funding data (for demo/testing without API).
+   */
+  loadFundingData(symbol: string, points: FundingRatePoint[]): void {
+    this.fundingHistory.set(symbol, points);
+  }
+
   getFundingHistory(symbol: string): FundingRatePoint[] {
     return this.fundingHistory.get(symbol) || [];
   }

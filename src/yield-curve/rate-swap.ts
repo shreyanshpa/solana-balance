@@ -57,13 +57,12 @@ export class RateSwapMarket {
     if (!tenorHours) return null;
 
     // Interpolate from the curve
+    if (curve.curve.length === 0) return null;
     const curvePoint = curve.curve.find((p) => p.horizonHours === tenorHours)
       || curve.curve.reduce((closest, p) =>
           Math.abs(p.horizonHours - tenorHours) < Math.abs(closest.horizonHours - tenorHours)
             ? p : closest
         );
-
-    if (!curvePoint) return null;
 
     const midRate = curvePoint.annualizedRate;
     const halfSpread = this.spreadBps / 10000 / 2;

@@ -28,6 +28,7 @@ interface DepositRecord {
   shares: number;
   depositAmount: number;
   depositTime: number;
+  personalHWM: number; // per-depositor high water mark (NAV at last fee crystallization)
 }
 
 interface RebalanceEvent {
@@ -37,22 +38,39 @@ interface RebalanceEvent {
   details: Record<string, number>;
 }
 
+// Tracks the full delta-neutral position (both legs)
+interface DNPosition {
+  symbol: string;
+  // Spot leg
+  spotSize: number;       // quantity of base asset held
+  spotEntryPrice: number; // weighted avg entry price for spot
+  // Perp leg (short)
+  perpSize: number;       // quantity shorted on perp
+  perpEntryPrice: number; // weighted avg entry price for perp
+  perpMargin: number;     // USDC collateral posted for short
+  // Combined
+  leverage: number;
+  capitalAllocated: number;
+}
+
 export class DeltaNeutralVault {
   private client: PacificaClient;
   private config: VaultConfig;
   private state: VaultState;
   private deposits: Map<string, DepositRecord> = new Map();
+  private dnPositions: DNPosition[] = [];
   private rebalanceHistory: RebalanceEvent[] = [];
 
   // Performance tracking
   private dailyNavHistory: Array<{ timestamp: number; nav: number }> = [];
   private cumulativeFunding: number = 0;
   private totalFees: number = 0;
+  private realizedPnl: number = 0; // P&L realized during rebalances
 
   // Fee structure
   private managementFeePct = 0.02;  // 2% annualized
-  private performanceFeePct = 0.10; // 10% of profits
-  private highWaterMark = 1.0;
+  private performanceFeePct = 0.10; // 10% of profits above HWM
+  private highWaterMark = 1.0;      // global HWM for NAV
 
   constructor(client: PacificaClient, config: VaultConfig) {
     this.client = client;
@@ -60,7 +78,7 @@ export class DeltaNeutralVault {
     this.state = {
       totalDeposits: 0,
       totalShares: 0,
-      nav: 1.0, // start at $1 per share
+      nav: 1.0,
       apy: 0,
       positions: [],
       lastRebalance: Date.now(),
@@ -75,7 +93,6 @@ export class DeltaNeutralVault {
   deposit(depositor: string, amount: number): { shares: number; nav: number } {
     if (amount <= 0) throw new Error("Deposit must be positive");
 
-    // Shares = deposit / NAV (first depositor gets 1:1)
     const sharesToMint = this.state.totalShares === 0
       ? amount
       : amount / this.state.nav;
@@ -83,7 +100,6 @@ export class DeltaNeutralVault {
     this.state.totalDeposits += amount;
     this.state.totalShares += sharesToMint;
 
-    // Record deposit
     const existing = this.deposits.get(depositor);
     if (existing) {
       existing.shares += sharesToMint;
@@ -94,6 +110,7 @@ export class DeltaNeutralVault {
         shares: sharesToMint,
         depositAmount: amount,
         depositTime: Date.now(),
+        personalHWM: this.state.nav,
       });
     }
 
@@ -102,6 +119,7 @@ export class DeltaNeutralVault {
 
   /**
    * Withdraw from the vault. Burns shares and returns USDC value.
+   * Performance fee is charged only on gains above the depositor's high water mark.
    */
   withdraw(depositor: string, sharesToBurn: number): { amount: number; fee: number } {
     const record = this.deposits.get(depositor);
@@ -109,16 +127,17 @@ export class DeltaNeutralVault {
     if (sharesToBurn > record.shares) throw new Error("Insufficient shares");
 
     const grossAmount = sharesToBurn * this.state.nav;
+    const costBasisPerShare = record.depositAmount / record.shares;
 
-    // Performance fee on profits above high water mark
-    const costBasis = (record.depositAmount / record.shares) * sharesToBurn;
-    const profit = Math.max(0, grossAmount - costBasis);
-    const perfFee = profit * this.performanceFeePct;
+    // Performance fee: only on gains above personal HWM
+    const profitPerShare = Math.max(0, this.state.nav - Math.max(costBasisPerShare, record.personalHWM));
+    const perfFee = profitPerShare * sharesToBurn * this.performanceFeePct;
 
     const netAmount = grossAmount - perfFee;
     this.totalFees += perfFee;
 
-    // Update state
+    // Update records
+    const costBasis = costBasisPerShare * sharesToBurn;
     record.shares -= sharesToBurn;
     record.depositAmount -= costBasis;
     this.state.totalShares -= sharesToBurn;
@@ -126,6 +145,9 @@ export class DeltaNeutralVault {
 
     if (record.shares <= 0) {
       this.deposits.delete(depositor);
+    } else {
+      // Update personal HWM to current NAV (crystallize gains)
+      record.personalHWM = Math.max(record.personalHWM, this.state.nav);
     }
 
     return { amount: netAmount, fee: perfFee };
@@ -144,16 +166,29 @@ export class DeltaNeutralVault {
     if (leverage > this.config.maxLeverage) {
       throw new Error(`Leverage ${leverage}x exceeds max ${this.config.maxLeverage}x`);
     }
+    if (currentPrice <= 0) throw new Error("Price must be positive");
+    if (capitalAllocation <= 0) throw new Error("Capital allocation must be positive");
 
-    // Size = capital allocated to this position
-    // Half goes to "spot" (simulated buy), half to short perp margin
     const spotCapital = capitalAllocation / 2;
     const perpMargin = capitalAllocation / 2;
-    const positionSize = spotCapital / currentPrice; // quantity of base asset
+    const positionSize = spotCapital / currentPrice;
 
+    // Track the full DN position internally
+    this.dnPositions.push({
+      symbol,
+      spotSize: positionSize,
+      spotEntryPrice: currentPrice,
+      perpSize: positionSize,
+      perpEntryPrice: currentPrice,
+      perpMargin,
+      leverage,
+      capitalAllocated: capitalAllocation,
+    });
+
+    // Also expose via the simplified VaultPosition interface
     const position: VaultPosition = {
       symbol,
-      side: "short", // the perp side is short
+      side: "short",
       size: positionSize,
       entryPrice: currentPrice,
       markPrice: currentPrice,
@@ -167,7 +202,7 @@ export class DeltaNeutralVault {
   }
 
   /**
-   * Simulate funding rate accrual on all short positions.
+   * Accrue funding rate payments on all short perp positions.
    * In production, this would be called after each funding settlement.
    */
   accrueForPeriod(fundingRates: Map<string, number>, periodHours: number = 1): {
@@ -177,32 +212,30 @@ export class DeltaNeutralVault {
     let totalFunding = 0;
     const byAsset: Record<string, number> = {};
 
-    for (const position of this.state.positions) {
-      const rate = fundingRates.get(position.symbol);
+    for (const dn of this.dnPositions) {
+      const rate = fundingRates.get(dn.symbol);
       if (rate === undefined) continue;
 
+      // Funding is paid on perp notional only
+      const perpNotional = dn.perpSize * (this.state.positions.find(p => p.symbol === dn.symbol)?.markPrice || dn.perpEntryPrice);
       // Short positions RECEIVE funding when rate is positive
-      // funding payment = rate * position_notional * periods
-      const notional = position.size * position.markPrice;
-      const funding = rate * notional * periodHours; // rate is per hour
-
-      // Positive rate = shorts receive, negative = shorts pay
-      const netFunding = position.side === "short" ? funding : -funding;
+      const netFunding = rate * perpNotional * periodHours;
 
       totalFunding += netFunding;
-      byAsset[position.symbol] = netFunding;
+      byAsset[dn.symbol] = netFunding;
     }
 
     this.cumulativeFunding += totalFunding;
     this.state.fundingEarned += totalFunding;
 
-    // Update NAV
+    // Update NAV with funding
     if (this.state.totalShares > 0) {
       this.state.nav += totalFunding / this.state.totalShares;
     }
 
     // Management fee accrual (hourly portion of annual fee)
-    const mgmtFee = (this.state.totalDeposits * this.managementFeePct * periodHours) / (365 * 24);
+    const aum = this.state.totalShares * this.state.nav;
+    const mgmtFee = (aum * this.managementFeePct * periodHours) / (365 * 24);
     this.totalFees += mgmtFee;
     if (this.state.totalShares > 0) {
       this.state.nav -= mgmtFee / this.state.totalShares;
@@ -213,6 +246,7 @@ export class DeltaNeutralVault {
 
   /**
    * Update mark prices and check if rebalancing is needed.
+   * Computes proper delta-neutral P&L: spot gains + perp gains ≈ 0.
    */
   updatePrices(prices: Map<string, number>): {
     needsRebalance: boolean;
@@ -220,87 +254,104 @@ export class DeltaNeutralVault {
   } {
     const reasons: string[] = [];
 
-    for (const position of this.state.positions) {
-      const newPrice = prices.get(position.symbol);
+    for (let i = 0; i < this.dnPositions.length; i++) {
+      const dn = this.dnPositions[i];
+      const pos = this.state.positions[i];
+      if (!pos) continue;
+
+      const newPrice = prices.get(dn.symbol);
       if (newPrice === undefined) continue;
 
-      const oldPrice = position.markPrice;
-      position.markPrice = newPrice;
+      pos.markPrice = newPrice;
 
-      // Delta-neutral P&L: spot leg + perp leg
-      // Spot leg: long position gains when price rises
-      const spotPnl = (newPrice - position.entryPrice) * position.size;
-      // Perp leg: short position gains when price drops
-      const perpPnl = -(newPrice - position.entryPrice) * position.size;
-      // Net P&L is ~0 (delta neutral) — any residual is from execution slippage
-      position.unrealizedPnl = spotPnl + perpPnl; // should be ~0
+      // Delta-neutral P&L: spot + perp legs cancel
+      const spotPnl = (newPrice - dn.spotEntryPrice) * dn.spotSize;
+      const perpPnl = -(newPrice - dn.perpEntryPrice) * dn.perpSize;
+      pos.unrealizedPnl = spotPnl + perpPnl; // ≈0 when balanced
 
-      // Check if leverage has drifted beyond threshold on the perp leg
-      const notional = position.size * newPrice;
-      const equity = position.margin + perpPnl;
-      const effectiveLeverage = equity > 0 ? notional / equity : 999;
-      const leverageDrift = Math.abs(effectiveLeverage - position.leverage) / position.leverage;
+      // Check perp leg leverage drift (this determines rebalance need)
+      const perpNotional = dn.perpSize * newPrice;
+      const perpEquity = dn.perpMargin + perpPnl;
+      const effectiveLeverage = perpEquity > 0 ? perpNotional / perpEquity : 999;
+      const leverageDrift = Math.abs(effectiveLeverage - dn.leverage) / dn.leverage;
 
       if (leverageDrift > this.config.rebalanceThresholdPct / 100) {
-        reasons.push(`${position.symbol}: leverage drifted to ${effectiveLeverage.toFixed(1)}x (target: ${position.leverage}x)`);
+        reasons.push(`${dn.symbol}: leverage drifted to ${effectiveLeverage.toFixed(1)}x (target: ${dn.leverage}x)`);
       }
 
-      // Check drawdown
-      const drawdown = -position.unrealizedPnl / position.margin;
-      if (drawdown > this.config.maxDrawdownPct / 100) {
-        reasons.push(`${position.symbol}: drawdown ${(drawdown * 100).toFixed(1)}% exceeds max ${this.config.maxDrawdownPct}%`);
+      // Check liquidation risk on perp leg
+      const liquidationThreshold = 0.9; // 90% margin used
+      if (perpEquity > 0 && perpEquity < dn.perpMargin * (1 - liquidationThreshold)) {
+        reasons.push(`${dn.symbol}: LIQUIDATION WARNING — perp equity at $${perpEquity.toFixed(0)} (${((perpEquity / dn.perpMargin) * 100).toFixed(1)}% of margin)`);
       }
     }
 
-    // Update total PnL
     this.state.pnl = this.state.positions.reduce((sum, p) => sum + p.unrealizedPnl, 0);
-
     return { needsRebalance: reasons.length > 0, reasons };
   }
 
   /**
    * Rebalance positions to maintain target leverage and delta neutrality.
+   * Realizes P&L into NAV before resetting position entries.
    */
   rebalance(prices: Map<string, number>): RebalanceEvent[] {
     const events: RebalanceEvent[] = [];
 
-    for (const position of this.state.positions) {
-      const price = prices.get(position.symbol) || position.markPrice;
-      const notional = position.size * price;
-      const perpPnl = -(price - position.entryPrice) * position.size;
-      const equity = position.margin + perpPnl;
-      if (equity <= 0) continue; // skip — would be liquidated in prod
-      const currentLeverage = notional / equity;
+    for (let i = 0; i < this.dnPositions.length; i++) {
+      const dn = this.dnPositions[i];
+      const pos = this.state.positions[i];
+      if (!pos) continue;
 
-      if (Math.abs(currentLeverage - position.leverage) / position.leverage > this.config.rebalanceThresholdPct / 100) {
-        // Adjust position size to restore target leverage
-        const targetNotional = equity * position.leverage;
-        const sizeAdjustment = (targetNotional - notional) / price;
+      const price = prices.get(dn.symbol) || pos.markPrice;
+      const perpNotional = dn.perpSize * price;
+      const perpPnl = -(price - dn.perpEntryPrice) * dn.perpSize;
+      const perpEquity = dn.perpMargin + perpPnl;
 
-        const event: RebalanceEvent = {
-          timestamp: Date.now(),
-          reason: `Leverage drift: ${currentLeverage.toFixed(2)}x → ${position.leverage}x`,
-          action: sizeAdjustment > 0 ? "increase_short" : "decrease_short",
-          details: {
-            symbol_idx: this.state.positions.indexOf(position),
-            oldSize: position.size,
-            newSize: position.size - sizeAdjustment, // short, so subtract
-            adjustment: Math.abs(sizeAdjustment),
-            price,
-          },
-        };
+      if (perpEquity <= 0) continue; // would be liquidated
 
-        // Apply rebalance — clamp size to prevent runaway growth
-        const newSize = Math.max(position.size - sizeAdjustment, 0);
-        position.size = newSize;
-        position.entryPrice = price; // reset entry for clean accounting
-        position.margin = newSize * price / position.leverage; // reset margin
-        position.unrealizedPnl = 0;
-        position.markPrice = price;
+      const currentLeverage = perpNotional / perpEquity;
+      const drift = Math.abs(currentLeverage - dn.leverage) / dn.leverage;
 
-        events.push(event);
-        this.rebalanceHistory.push(event);
-      }
+      if (drift <= this.config.rebalanceThresholdPct / 100) continue;
+
+      // Step 1: Realize the perp P&L into NAV
+      // The spot P&L offsets (delta neutral), but margin needs updating
+      const spotPnl = (price - dn.spotEntryPrice) * dn.spotSize;
+      const netRealized = spotPnl + perpPnl; // should be ~0
+      this.realizedPnl += netRealized;
+
+      // Step 2: Compute new target size
+      const targetNotional = perpEquity * dn.leverage;
+      const newSize = targetNotional / price;
+
+      const event: RebalanceEvent = {
+        timestamp: Date.now(),
+        reason: `Leverage drift: ${currentLeverage.toFixed(2)}x → ${dn.leverage}x`,
+        action: newSize > dn.perpSize ? "increase_short" : "decrease_short",
+        details: {
+          oldSize: dn.perpSize,
+          newSize,
+          price,
+          realizedPnl: netRealized,
+        },
+      };
+
+      // Step 3: Reset both legs at current price with new size
+      dn.spotSize = newSize;
+      dn.spotEntryPrice = price;
+      dn.perpSize = newSize;
+      dn.perpEntryPrice = price;
+      dn.perpMargin = perpEquity; // margin absorbs realized P&L
+
+      // Update simplified position view
+      pos.size = newSize;
+      pos.entryPrice = price;
+      pos.markPrice = price;
+      pos.margin = perpEquity;
+      pos.unrealizedPnl = 0;
+
+      events.push(event);
+      this.rebalanceHistory.push(event);
     }
 
     this.state.lastRebalance = Date.now();
@@ -324,7 +375,6 @@ export class DeltaNeutralVault {
 
     if (periodDays === 0 || startNav === 0) return 0;
 
-    // Annualize: (endNav/startNav)^(365/days) - 1
     const apy = Math.pow(endNav / startNav, 365 / periodDays) - 1;
     this.state.apy = apy;
     return apy;
@@ -336,7 +386,6 @@ export class DeltaNeutralVault {
   snapshotNav(): void {
     this.dailyNavHistory.push({ timestamp: Date.now(), nav: this.state.nav });
 
-    // Update high water mark
     if (this.state.nav > this.highWaterMark) {
       this.highWaterMark = this.state.nav;
     }
@@ -350,6 +399,7 @@ export class DeltaNeutralVault {
     cumulativeFunding: number;
     totalFees: number;
     highWaterMark: number;
+    realizedPnl: number;
     trailing7dAPY: number;
   } {
     return {
@@ -358,6 +408,7 @@ export class DeltaNeutralVault {
       cumulativeFunding: this.cumulativeFunding,
       totalFees: this.totalFees,
       highWaterMark: this.highWaterMark,
+      realizedPnl: this.realizedPnl,
       trailing7dAPY: this.computeTrailingAPY(7),
     };
   }
@@ -378,12 +429,7 @@ export class DeltaNeutralVault {
     const pnl = currentValue - record.depositAmount;
     const pnlPct = record.depositAmount > 0 ? pnl / record.depositAmount : 0;
 
-    return {
-      shares: record.shares,
-      currentValue,
-      pnl,
-      pnlPct,
-    };
+    return { shares: record.shares, currentValue, pnl, pnlPct };
   }
 
   /**
@@ -391,5 +437,12 @@ export class DeltaNeutralVault {
    */
   getRebalanceHistory(): RebalanceEvent[] {
     return this.rebalanceHistory;
+  }
+
+  /**
+   * Get internal DN position details (for debugging/display).
+   */
+  getDNPositions(): DNPosition[] {
+    return this.dnPositions;
   }
 }

@@ -113,14 +113,19 @@ export function rollingVolatility(
 // ============================================================
 
 /**
- * Annualize a per-period funding rate.
+ * Annualize a per-period funding rate using compound formula.
  * Pacifica settles funding hourly.
+ * For small rates (<0.1%), compound ≈ linear, but this is correct at all scales.
  */
 export function annualizeFundingRate(
   hourlyRate: number,
   periodsPerDay: number = 24
 ): number {
-  return hourlyRate * periodsPerDay * 365;
+  const periodsPerYear = periodsPerDay * 365;
+  // Use compound formula: (1 + r)^n - 1
+  // For very small rates, clamp to avoid floating point issues
+  if (Math.abs(hourlyRate) < 1e-12) return 0;
+  return Math.pow(1 + hourlyRate, periodsPerYear) - 1;
 }
 
 /**
@@ -175,11 +180,16 @@ export function classifyCurveShape(
 
   const first = rates[0];
   const last = rates[rates.length - 1];
-  const mid = rates[Math.floor(rates.length / 2)];
   const spreadBps = (last - first) * 10000;
 
-  if (Math.abs(spreadBps) < 50) return "flat";
-  if (mid > first && mid > last) return "humped";
+  // Check for hump: is the max rate at an interior point?
+  const maxRate = Math.max(...rates);
+  const maxIdx = rates.indexOf(maxRate);
+  const isInteriorMax = maxIdx > 0 && maxIdx < rates.length - 1;
+  const humpMagnitude = (maxRate - Math.max(first, last)) * 10000;
+
+  if (Math.abs(spreadBps) < 50 && humpMagnitude < 50) return "flat";
+  if (isInteriorMax && humpMagnitude > 50) return "humped";
   if (last > first) return "normal";
   return "inverted";
 }
@@ -217,6 +227,7 @@ export function varianceSwapPayoff(
   strikeVar: number,
   vegaNotional: number
 ): number {
+  if (strikeVar <= 0) return 0;
   return vegaNotional * (realizedVar - strikeVar) / (2 * Math.sqrt(strikeVar));
 }
 

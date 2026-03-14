@@ -7,8 +7,10 @@
  */
 
 import { PacificaClient } from "../common/pacifica-client";
+import { annualizeFundingRate } from "../common/math";
 import { YieldCurveEngine } from "./engine";
 import { RateSwapMarket } from "./rate-swap";
+import { FundingRatePredictor } from "./predictor";
 
 // ============================================================
 // Demo Data Generator (for when API is unavailable)
@@ -93,11 +95,10 @@ async function main() {
       const points = rates.map((r) => ({
         symbol,
         rate: r.rate,
-        annualizedRate: r.rate * 24 * 365,
+        annualizedRate: annualizeFundingRate(r.rate),
         timestamp: r.timestamp,
       }));
-      // Access private field for demo purposes
-      (engine as any).fundingHistory.set(symbol, points);
+      engine.loadFundingData(symbol, points);
     }
   }
 
@@ -185,8 +186,42 @@ async function main() {
     }
   }
 
-  // ---- Step 7: Full Report ----
-  console.log("\n\n━━━ FULL REPORT SUMMARY ━━━\n");
+  // ---- Step 7: Funding Rate Predictions (OU Model + Forward Curves) ----
+  console.log("\n\n━━━ FUNDING RATE PREDICTIONS ━━━\n");
+
+  const predictor = new FundingRatePredictor();
+  // Build a Map from engine's funding history
+  const allHistory = new Map<string, any[]>();
+  for (const symbol of engine.getAllCurves().keys()) {
+    allHistory.set(symbol, engine.getFundingHistory(symbol));
+  }
+  predictor.loadData(allHistory, engine.getAllCurves());
+
+  const predictionAssets = focusSymbol ? [focusSymbol] : ["BTC-PERP", "ETH-PERP", "SOL-PERP"];
+  for (const symbol of predictionAssets) {
+    const prediction = predictor.predict(symbol);
+    if (prediction) {
+      console.log(predictor.formatReport(prediction));
+      console.log();
+    }
+  }
+
+  // Show forward rate curve
+  console.log("━━━ FORWARD RATE CURVES ━━━\n");
+  for (const symbol of predictionAssets) {
+    const forwards = predictor.extractForwardRates(symbol);
+    if (forwards.length > 0) {
+      console.log(`${symbol} implied forward rates:`);
+      for (const f of forwards) {
+        const sign = f.forwardRate >= 0 ? "+" : "";
+        console.log(`  ${f.startHorizon} → ${f.endHorizon}: ${sign}${(f.forwardRate * 100).toFixed(2)}% annualized`);
+      }
+      console.log();
+    }
+  }
+
+  // ---- Step 8: Full Report ----
+  console.log("\n━━━ FULL REPORT SUMMARY ━━━\n");
   const report = engine.generateReport();
   console.log(report.summary);
 

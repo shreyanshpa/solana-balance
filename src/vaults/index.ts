@@ -9,6 +9,7 @@
 import { PacificaClient } from "../common/pacifica-client";
 import { DeltaNeutralVault } from "./delta-neutral";
 import { VarianceSwapEngine } from "./variance-swap";
+import { RiskManager } from "./risk-manager";
 import type { VaultConfig } from "../common/types";
 
 // ============================================================
@@ -212,6 +213,67 @@ async function main() {
     console.log(
       `     Alice withdraws ${halfShares.toFixed(2)} shares → $${withdrawal.amount.toFixed(2)} (fee: $${withdrawal.fee.toFixed(2)})`
     );
+  }
+
+  // ================================================================
+  // PART 1.5: Risk Management
+  // ================================================================
+
+  console.log("\n\n━━━ RISK MANAGEMENT ANALYSIS ━━━\n");
+
+  const riskMgr = new RiskManager(vaultConfig);
+
+  // Feed funding rate history into risk manager
+  for (let h = 0; h < simHours; h++) {
+    for (const [symbol, rate] of fundingRatesHistory[h]) {
+      riskMgr.recordFundingRate(symbol, rate);
+    }
+  }
+
+  // Seed reserve fund (5% of AUM in production)
+  riskMgr.addToReserve(totalDeposited * 0.05);
+
+  // Compute risk metrics using final state
+  const lastPrices = priceHistory[priceHistory.length - 1];
+  const lastFunding = fundingRatesHistory[fundingRatesHistory.length - 1];
+  const riskMetrics = riskMgr.computeRiskMetrics(
+    status.positions,
+    lastFunding,
+    totalDeposited
+  );
+
+  console.log("  Risk Scores (0-100, higher = more risk):");
+  console.log(`     Liquidation:      ${riskMetrics.liquidationRiskScore.toFixed(0)}/100`);
+  console.log(`     Funding:          ${riskMetrics.fundingRiskScore.toFixed(0)}/100`);
+  console.log(`     Concentration:    ${riskMetrics.concentrationRiskScore.toFixed(0)}/100`);
+  console.log(`     OVERALL:          ${riskMetrics.overallRiskScore}/100`);
+  console.log();
+  console.log(`  Collateral ratio:     ${(riskMetrics.totalCollateralRatio * 100).toFixed(1)}%`);
+  console.log(`  Avg weighted funding: ${(riskMetrics.weightedAvgFunding * 10000).toFixed(2)} bps/h`);
+  console.log(`  Max concentration:    ${(riskMetrics.maxSingleAssetPct * 100).toFixed(0)}% of AUM`);
+  console.log(`  Reserve fund:         $${riskMgr.getReserveFund().toLocaleString()}`);
+  console.log(`  Negative funding stress (24h): -$${riskMetrics.negativeFundingExposure.toFixed(0)}`);
+
+  // Show per-position risk
+  console.log("\n  Per-Position Risk:");
+  for (const pr of riskMetrics.positions) {
+    console.log(`     ${pr.symbol}:`);
+    console.log(`       Margin ratio: ${(pr.marginRatio * 100).toFixed(1)}% | Dist to liq: ${(pr.distanceToLiquidation * 100).toFixed(1)}% | Funding vol: ${(pr.fundingRateVolatility * 10000).toFixed(1)}bps`);
+
+    const delev = riskMgr.shouldDeleverage(pr);
+    if (delev.deleverage) {
+      console.log(`       ⚠️  ${delev.reason} (reduce by ${(delev.targetReduction * 100).toFixed(0)}%)`);
+    }
+  }
+
+  // Show alerts
+  const alerts = riskMgr.getAlerts();
+  if (alerts.length > 0) {
+    console.log("\n  Active Alerts:");
+    for (const alert of alerts.slice(0, 5)) {
+      const icon = alert.severity === "critical" ? "🔴" : alert.severity === "warning" ? "🟡" : "🔵";
+      console.log(`     ${icon} [${alert.type}] ${alert.message}`);
+    }
   }
 
   // ================================================================
