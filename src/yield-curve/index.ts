@@ -11,6 +11,7 @@ import { annualizeFundingRate } from "../common/math";
 import { YieldCurveEngine } from "./engine";
 import { RateSwapMarket } from "./rate-swap";
 import { FundingRatePredictor } from "./predictor";
+import { MarginEngine } from "./margin-engine";
 
 // ============================================================
 // Demo Data Generator (for when API is unavailable)
@@ -220,8 +221,73 @@ async function main() {
     }
   }
 
-  // ---- Step 8: Full Report ----
-  console.log("\n━━━ FULL REPORT SUMMARY ━━━\n");
+  // ---- Step 8: Margin Engine Demo ----
+  console.log("\n━━━ MARGIN ENGINE — TradFi-Grade Swap Infrastructure ━━━\n");
+
+  const marginEngine = new MarginEngine();
+
+  // Setup margin accounts (swap uses "user" and "market_maker" as counterparties)
+  console.log("Setting up margin accounts...\n");
+  const traderAccount = marginEngine.depositMargin("user", 50000);
+  const mmAccount = marginEngine.depositMargin("market_maker", 200000);
+  console.log(`  user:         $${traderAccount.balance.toLocaleString()} deposited`);
+  console.log(`  market_maker: $${mmAccount.balance.toLocaleString()} deposited`);
+
+  // Feed rate volatility for dynamic IM scaling
+  const solHistory = engine.getFundingHistory("SOL-PERP");
+  if (solHistory.length > 0) {
+    marginEngine.updateRateVolatility(solHistory.map(r => r.rate));
+  }
+
+  // Execute a margined swap
+  console.log("\n  Executing margined 7d SOL-PERP swap ($100K notional)...");
+  const marginedSwap = swapMarket.executeSwap("SOL-PERP", "7d", 100000, "pay_fixed");
+  if (marginedSwap) {
+    const lockResult = marginEngine.lockMarginForSwap(marginedSwap, "7d");
+    if (lockResult.success) {
+      console.log(`  IM locked: $${lockResult.marginRequired?.toFixed(2)} from each party`);
+
+      const traderAfter = marginEngine.getAccount("user");
+      const mmAfter = marginEngine.getAccount("market_maker");
+      console.log(`  user available:         $${traderAfter?.availableBalance.toFixed(2)}`);
+      console.log(`  market_maker available: $${mmAfter?.availableBalance.toFixed(2)}`);
+
+      // Simulate daily VM settlements
+      console.log("\n  Simulating 3 days of variation margin settlement...");
+      const dailyMTMs = [250, -180, 420]; // simulated MTM trajectory
+
+      for (let day = 0; day < dailyMTMs.length; day++) {
+        const vm = marginEngine.settleVariationMargin(marginedSwap, dailyMTMs[day]);
+        if (vm) {
+          const direction = vm.settlementAmount > 0 ? "payer receives" : "receiver receives";
+          console.log(`    Day ${day + 1}: MTM $${dailyMTMs[day].toFixed(0)} → settlement $${Math.abs(vm.settlementAmount).toFixed(2)} (${direction})`);
+        }
+      }
+
+      // Portfolio DV01
+      const dv01 = marginEngine.computePortfolioDV01([marginedSwap]);
+      console.log(`\n  Portfolio DV01: $${dv01.totalDV01.toFixed(4)} per 1bp rate move`);
+
+      // Execute a second swap for netting demo
+      const swap2 = swapMarket.executeSwap("SOL-PERP", "14d", 75000, "receive_fixed");
+      if (swap2) {
+        marginEngine.lockMarginForSwap(swap2, "14d");
+        const netting = marginEngine.computeNetMarginRequirement([marginedSwap, swap2]);
+        console.log(`\n  Netting Analysis (2 swaps):`);
+        console.log(`    Gross margin: $${netting.grossMargin.toFixed(2)}`);
+        console.log(`    Net margin:   $${netting.netMargin.toFixed(2)}`);
+        console.log(`    Benefit:      $${netting.nettingBenefit.toFixed(2)} saved (${((netting.nettingBenefit / netting.grossMargin) * 100).toFixed(0)}% reduction)`);
+      }
+
+      // Show full margin report
+      console.log("\n" + marginEngine.formatReport([marginedSwap, ...(swap2 ? [swap2] : [])]));
+    } else {
+      console.log(`  Margin lock failed: ${lockResult.reason}`);
+    }
+  }
+
+  // ---- Step 9: Full Report ----
+  console.log("\n\n━━━ FULL REPORT SUMMARY ━━━\n");
   const report = engine.generateReport();
   console.log(report.summary);
 

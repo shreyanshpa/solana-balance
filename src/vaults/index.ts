@@ -7,9 +7,15 @@
  */
 
 import { PacificaClient } from "../common/pacifica-client";
+import { annualizeFundingRate, mean } from "../common/math";
 import { DeltaNeutralVault } from "./delta-neutral";
 import { VarianceSwapEngine } from "./variance-swap";
 import { RiskManager } from "./risk-manager";
+import { ComposableVault } from "./composable-vault";
+import type { ComposableVaultConfig } from "./composable-vault";
+import { YieldCurveEngine } from "../yield-curve/engine";
+import { RateSwapMarket } from "../yield-curve/rate-swap";
+import { MarginEngine } from "../yield-curve/margin-engine";
 import type { VaultConfig } from "../common/types";
 
 // ============================================================
@@ -392,7 +398,189 @@ async function main() {
     }
   }
 
+  // ================================================================
+  // PART 3: Composable Vault — Cross-Product Integration
+  // ================================================================
+
+  console.log("\n\n━━━ PART 3: COMPOSABLE VAULT — MULTI-STRATEGY DEMO ━━━\n");
+
+  // Build yield curve from the same funding data (for IRS hedging)
+  const yieldEngine = new YieldCurveEngine(client);
+  // Generate demo funding data for the yield curve
+  const now = Date.now();
+  const hourMs = 3600 * 1000;
+  for (const symbol of symbols) {
+    const baseRates: Record<string, number> = { "BTC-PERP": 0.0001, "ETH-PERP": 0.00015, "SOL-PERP": 0.0002 };
+    const base = baseRates[symbol] || 0.0001;
+    const points = [];
+    for (let h = 720; h >= 0; h--) {
+      const noise = (Math.random() - 0.5) * base;
+      const rate = base + noise;
+      points.push({
+        symbol,
+        rate,
+        annualizedRate: annualizeFundingRate(rate),
+        timestamp: now - h * hourMs,
+      });
+    }
+    yieldEngine.loadFundingData(symbol, points);
+  }
+  yieldEngine.buildAllCurves();
+
+  const swapMarket = new RateSwapMarket(yieldEngine, 100);
+  const marginEngine = new MarginEngine();
+
+  // Setup margin accounts for the vault
+  marginEngine.depositMargin("composable_vault", 100000);
+  marginEngine.depositMargin("market_maker", 500000);
+
+  const composableConfig: ComposableVaultConfig = {
+    name: "Pacifica Composable Yield Vault",
+    strategy: "delta_neutral",
+    targetAssets: symbols,
+    maxLeverage: 3,
+    rebalanceThresholdPct: 20,
+    maxDrawdownPct: 15,
+    // Composable features
+    irsHedgeEnabled: true,
+    irsHedgeRatio: 0.5,          // hedge 50% of funding exposure
+    irsPreferredTenor: "7d",
+    varianceSellingEnabled: true,
+    varianceAllocationPct: 0.05,  // 5% of AUM to short variance
+    variancePreferredTenor: "7d",
+    dynamicAllocationEnabled: true,
+  };
+
+  const composableVault = new ComposableVault(client, composableConfig, swapMarket, marginEngine);
+
+  // Deposits
+  console.log("  Deposits:");
+  for (const d of depositors) {
+    const result = composableVault.deposit(d.name, d.amount);
+    console.log(`    ${d.name}: $${d.amount.toLocaleString()} → ${result.shares.toFixed(2)} shares`);
+  }
+
+  // Open DN positions
+  console.log("\n  Opening DN positions...");
+  for (const [symbol, pct] of Object.entries(allocations)) {
+    const capital = totalDeposited * pct;
+    composableVault.openPosition(symbol, capital, startPrices[symbol], 2);
+  }
+
+  // Place IRS hedges
+  console.log("\n  Placing IRS hedges...");
+  for (const symbol of symbols) {
+    const hedge = composableVault.placeIRSHedge(symbol);
+    if (hedge) {
+      console.log(`    ${symbol}: pay fixed ${(hedge.fixedRate * 100).toFixed(2)}% on $${hedge.notional.toLocaleString()} (7d swap)`);
+    }
+  }
+
+  // Open short variance positions
+  console.log("\n  Opening short variance positions...");
+  // Need to load price data for variance engine
+  const baseVarEngine = composableVault.getVarianceEngine();
+  for (const symbol of symbols) {
+    baseVarEngine.loadDemoPrices(symbol, startPrices[symbol], symbol === "SOL-PERP" ? 0.85 : 0.55, 30);
+    baseVarEngine.buildVolTermStructure(symbol);
+    const contractId = composableVault.openVariancePosition(symbol);
+    if (contractId) {
+      const quote = baseVarEngine.getQuote(symbol, "7d");
+      console.log(`    ${symbol}: short variance @ ${quote ? (quote.midVol * 100).toFixed(1) : "?"}% implied vol ($${(totalDeposited * composableConfig.varianceAllocationPct).toFixed(0)} vega)`);
+    }
+  }
+
+  // Simulate 7 days with dynamic allocation
+  console.log("\n  Simulating 7 days with all strategies active...\n");
+
+  let totalNetYield = 0;
+  let allocationChanges = 0;
+
+  // Phase 1: Normal funding (days 1-3)
+  for (let h = 0; h < 72; h++) {
+    const result = composableVault.executePeriod(fundingRatesHistory[h], priceHistory[h], 1);
+    totalNetYield += result.netYield;
+
+    // Feed variance observations every 4 hours
+    if (h % 4 === 0) {
+      for (const symbol of symbols) {
+        const price = priceHistory[h].get(symbol);
+        if (price) composableVault.addVarianceObservation(symbol, price);
+      }
+    }
+
+    if (result.allocationChange) {
+      allocationChanges++;
+      console.log(`    Hour ${h}: ${result.allocationChange}`);
+    }
+    if (h % 24 === 0) composableVault.getBaseVault().snapshotNav();
+  }
+
+  // Phase 2: Simulate negative funding (days 4-5) — trigger dynamic allocation
+  console.log("    --- Simulating negative funding environment (days 4-5) ---");
+  for (let h = 72; h < 120; h++) {
+    const negativeFunding = new Map<string, number>();
+    for (const symbol of symbols) {
+      // Force negative funding to test allocation shift
+      negativeFunding.set(symbol, -0.00015 + (Math.random() - 0.5) * 0.00005);
+    }
+
+    const result = composableVault.executePeriod(negativeFunding, priceHistory[h], 1);
+    totalNetYield += result.netYield;
+
+    if (h % 4 === 0) {
+      for (const symbol of symbols) {
+        const price = priceHistory[h].get(symbol);
+        if (price) composableVault.addVarianceObservation(symbol, price);
+      }
+    }
+
+    if (result.allocationChange) {
+      allocationChanges++;
+      console.log(`    Hour ${h}: ${result.allocationChange}`);
+    }
+    if (h % 24 === 0) composableVault.getBaseVault().snapshotNav();
+  }
+
+  // Phase 3: Funding recovery (days 6-7) — shift back
+  console.log("    --- Funding recovery (days 6-7) ---");
+  for (let h = 120; h < simHours; h++) {
+    const result = composableVault.executePeriod(fundingRatesHistory[h], priceHistory[h], 1);
+    totalNetYield += result.netYield;
+
+    if (h % 4 === 0) {
+      for (const symbol of symbols) {
+        const price = priceHistory[h].get(symbol);
+        if (price) composableVault.addVarianceObservation(symbol, price);
+      }
+    }
+
+    if (result.allocationChange) {
+      allocationChanges++;
+      console.log(`    Hour ${h}: ${result.allocationChange}`);
+    }
+    if (h % 24 === 0) composableVault.getBaseVault().snapshotNav();
+  }
+
+  console.log(`\n  Simulation complete: ${allocationChanges} allocation changes over 7 days.`);
+
+  // Yield attribution
+  console.log("\n  ── Yield Attribution ──\n");
+  const attribution = composableVault.getYieldAttribution();
+  for (const a of attribution) {
+    const sign = a.amount >= 0 ? "+" : "";
+    console.log(`    ${a.source.padEnd(24)} ${sign}$${a.amount.toFixed(2).padStart(12)}  ${a.description}`);
+  }
+  const totalAttr = attribution.reduce((s, a) => s + a.amount, 0);
+  console.log(`    ${"─".repeat(50)}`);
+  console.log(`    ${"NET YIELD".padEnd(24)} ${totalAttr >= 0 ? "+" : ""}$${totalAttr.toFixed(2).padStart(12)}`);
+
+  // Full dashboard
+  console.log("\n" + composableVault.formatDashboard());
+
   console.log("\n\n✅ PacificaVaults demo complete.");
+  console.log("The composable vault demonstrates how IRS hedging, variance selling,");
+  console.log("and dynamic allocation compose into a full-stack yield strategy.");
   console.log("In production: vaults auto-compound, variance swaps settle on-chain with oracle data.");
 }
 

@@ -53,6 +53,32 @@ interface DNPosition {
   capitalAllocated: number;
 }
 
+// ============================================================
+// Dynamic Allocation — Ethena-style stablecoin rotation
+// ============================================================
+
+export type AllocationMode = "full_dn" | "partial_stablecoin" | "defensive";
+
+export interface AllocationState {
+  mode: AllocationMode;
+  dnAllocationPct: number;          // % of capital in delta-neutral positions
+  stablecoinAllocationPct: number;  // % parked in stablecoins earning base yield
+  stablecoinBalance: number;        // USDC parked in stablecoin yield
+  stablecoinYieldAPR: number;       // base rate earned on idle capital (e.g., 4.5% T-bill proxy)
+  accruedStablecoinYield: number;   // total yield earned from stablecoin parking
+  rollingFundingAvg24h: number;     // 24h rolling average funding rate
+  fundingHistory: number[];         // recent hourly funding rates for rolling window
+  lastModeChange: number;           // timestamp of last allocation mode change
+}
+
+export interface AllocationEvent {
+  timestamp: number;
+  fromMode: AllocationMode;
+  toMode: AllocationMode;
+  capitalShifted: number;
+  reason: string;
+}
+
 export class DeltaNeutralVault {
   private client: PacificaClient;
   private config: VaultConfig;
@@ -71,6 +97,27 @@ export class DeltaNeutralVault {
   private managementFeePct = 0.02;  // 2% annualized
   private performanceFeePct = 0.10; // 10% of profits above HWM
   private highWaterMark = 1.0;      // global HWM for NAV
+
+  // Dynamic allocation state (Ethena-style)
+  private allocation: AllocationState = {
+    mode: "full_dn",
+    dnAllocationPct: 1.0,
+    stablecoinAllocationPct: 0,
+    stablecoinBalance: 0,
+    stablecoinYieldAPR: 0.045,   // 4.5% base rate (T-bill / lending proxy)
+    accruedStablecoinYield: 0,
+    rollingFundingAvg24h: 0,
+    fundingHistory: [],
+    lastModeChange: Date.now(),
+  };
+  private allocationEvents: AllocationEvent[] = [];
+
+  // Dynamic allocation thresholds
+  private fundingThresholdNegative = -0.00002;    // shift to stablecoins when 24h avg below this
+  private fundingThresholdRecovery = 0.00005;      // shift back when 24h avg above this
+  private partialStablecoinPct = 0.30;             // park 30% in stablecoins during partial mode
+  private defensiveStablecoinPct = 0.60;           // park 60% in stablecoins during defensive mode
+  private defensiveFundingThreshold = -0.0001;     // deep negative triggers defensive mode
 
   constructor(client: PacificaClient, config: VaultConfig) {
     this.client = client;
@@ -444,5 +491,131 @@ export class DeltaNeutralVault {
    */
   getDNPositions(): DNPosition[] {
     return this.dnPositions;
+  }
+
+  // ============================================================
+  // Dynamic Stablecoin Allocation (Ethena-style)
+  // ============================================================
+
+  /**
+   * Update allocation based on current funding rate conditions.
+   * Called each period alongside accrueForPeriod().
+   *
+   * Logic mirrors Ethena's approach:
+   * - When funding is healthy (positive): 100% in DN positions
+   * - When funding turns mildly negative: shift 30% to stablecoins earning base rate
+   * - When funding is deeply negative: shift 60% to stablecoins (defensive mode)
+   * - When funding recovers: gradually shift back to DN
+   */
+  updateAllocation(avgFundingRate: number): AllocationEvent | null {
+    // Track funding rate for rolling average
+    this.allocation.fundingHistory.push(avgFundingRate);
+    if (this.allocation.fundingHistory.length > 24) {
+      this.allocation.fundingHistory.shift();
+    }
+
+    // Compute 24h rolling average
+    this.allocation.rollingFundingAvg24h = this.allocation.fundingHistory.length > 0
+      ? mean(this.allocation.fundingHistory)
+      : avgFundingRate;
+
+    const avg = this.allocation.rollingFundingAvg24h;
+    const currentMode = this.allocation.mode;
+    let newMode: AllocationMode = currentMode;
+
+    // Determine target mode based on funding conditions
+    if (avg <= this.defensiveFundingThreshold) {
+      newMode = "defensive";
+    } else if (avg <= this.fundingThresholdNegative) {
+      newMode = "partial_stablecoin";
+    } else if (avg >= this.fundingThresholdRecovery) {
+      newMode = "full_dn";
+    }
+    // In between thresholds: stay in current mode (hysteresis)
+
+    if (newMode === currentMode) return null;
+
+    // Execute the allocation shift
+    const aum = this.state.totalShares * this.state.nav;
+    const prevStablecoinPct = this.allocation.stablecoinAllocationPct;
+    let targetStablecoinPct = 0;
+
+    switch (newMode) {
+      case "full_dn":
+        targetStablecoinPct = 0;
+        break;
+      case "partial_stablecoin":
+        targetStablecoinPct = this.partialStablecoinPct;
+        break;
+      case "defensive":
+        targetStablecoinPct = this.defensiveStablecoinPct;
+        break;
+    }
+
+    const capitalShifted = Math.abs(targetStablecoinPct - prevStablecoinPct) * aum;
+
+    // Update allocation state
+    this.allocation.mode = newMode;
+    this.allocation.dnAllocationPct = 1 - targetStablecoinPct;
+    this.allocation.stablecoinAllocationPct = targetStablecoinPct;
+    this.allocation.stablecoinBalance = aum * targetStablecoinPct;
+    this.allocation.lastModeChange = Date.now();
+
+    const event: AllocationEvent = {
+      timestamp: Date.now(),
+      fromMode: currentMode,
+      toMode: newMode,
+      capitalShifted,
+      reason: newMode === "defensive"
+        ? `Deep negative funding (24h avg: ${(avg * 10000).toFixed(2)}bps) — shifting ${(targetStablecoinPct * 100).toFixed(0)}% to stablecoins`
+        : newMode === "partial_stablecoin"
+          ? `Negative funding detected (24h avg: ${(avg * 10000).toFixed(2)}bps) — parking ${(targetStablecoinPct * 100).toFixed(0)}% in stablecoins`
+          : `Funding recovered (24h avg: ${(avg * 10000).toFixed(2)}bps) — deploying 100% to DN positions`,
+    };
+
+    this.allocationEvents.push(event);
+    return event;
+  }
+
+  /**
+   * Accrue stablecoin yield on parked capital.
+   * Called each period — stablecoin balance earns base APR.
+   */
+  accrueStablecoinYield(periodHours: number = 1): number {
+    if (this.allocation.stablecoinBalance <= 0) return 0;
+
+    const hourlyRate = this.allocation.stablecoinYieldAPR / (365 * 24);
+    const yield_ = this.allocation.stablecoinBalance * hourlyRate * periodHours;
+
+    this.allocation.accruedStablecoinYield += yield_;
+
+    // Add yield to NAV
+    if (this.state.totalShares > 0) {
+      this.state.nav += yield_ / this.state.totalShares;
+    }
+
+    return yield_;
+  }
+
+  /**
+   * Get the effective capital deployed in DN positions (after stablecoin parking).
+   */
+  getEffectiveDNCapital(): number {
+    const aum = this.state.totalShares * this.state.nav;
+    return aum * this.allocation.dnAllocationPct;
+  }
+
+  /**
+   * Get allocation state for display.
+   */
+  getAllocationState(): AllocationState {
+    return { ...this.allocation };
+  }
+
+  /**
+   * Get allocation change history.
+   */
+  getAllocationEvents(): AllocationEvent[] {
+    return this.allocationEvents;
   }
 }
